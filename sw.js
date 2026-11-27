@@ -1,5 +1,5 @@
 // Cooking PWA service worker – bump VERSION with each release so phones pick up the update
-const VERSION = '2026-11-27.1';
+const VERSION = '2026-11-27.2';
 const CACHE = 'cooking-' + VERSION;
 const ASSETS = ['./', './index.html', './manifest.webmanifest', './icons/icon.svg', './icons/icon-192.png', './icons/icon-512.png', './icons/maskable-512.png'];
 

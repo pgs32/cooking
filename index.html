@@ -128,7 +128,7 @@ th{color:var(--acc2)}
 </nav>
 <script>
 'use strict';
-const VERSION = '2026-11-27.1';
+const VERSION = '2026-11-27.2';
 const KEY = 'cooking.data.v1';
 const UIKEY = 'cooking.ui.v1';
 const FALLBACK_PROXIES = [
@@ -245,6 +245,7 @@ function setHeader(title, o = {}) {
 }
 let lastView = '';
 function render() {
+  if (location.hash.startsWith('#cookimport=')) { handleCookImport(location.hash.slice(12)); return; }
   const h = decodeURIComponent(location.hash.slice(1)) || 'recipes';
   const [v, arg] = h.split('/');
   const tab = ['recipe', 'edit', 'import'].includes(v) ? 'recipes' : v;
@@ -557,7 +558,10 @@ function viewImport() {
     <button class="btn primary block mt" onclick="importUrl()">Import recipe</button>
     <div id="istat" class="status"></div>
     <p class="hint">Works with most recipe sites (BBC Good Food, Delicious, Jamie Oliver, AllRecipes, Guardian, NYT, blogs using recipe cards…). Tip: in Chrome, use <b>Share → Cooking</b> on a recipe page once the app is installed.</p>
-  </div>` : ''}
+  </div>
+  <div class="card"><h3>🔖 Tesco, Waitrose &amp; other sites that block importing</h3>
+    <p class="muted">Add the <b>Save to Cooking</b> bookmark once. Then on the recipe page, tap it and the recipe comes straight here – it works on any site because it reads the page in your own browser.</p>
+    <button class="btn block" onclick="bookmarkletHelp()">Set up Save to Cooking</button></div>` : ''}
   ${t === 'text' ? `<div class="card">
     <label for="it">Paste the recipe text</label>
     <textarea id="it" style="min-height:260px" placeholder="Recipe name&#10;Serves 4&#10;&#10;Ingredients&#10;200g flour&#10;…&#10;&#10;Method&#10;1. Heat the oven…">${esc(pendingImport?.text || '')}</textarea>
@@ -580,37 +584,94 @@ function viewImport() {
 }
 async function pasteClip(id) { try { $('#' + id).value = await navigator.clipboard.readText(); } catch (e) { toast('Long-press the box and choose Paste'); } }
 function proxyUrl(tpl, url) { return tpl.includes('{url}') ? tpl.replace('{url}', encodeURIComponent(url)) : tpl + encodeURIComponent(url); }
-async function fetchPage(url, onTry) {
-  const tries = [url];
-  if (S.settings.proxy) tries.push(proxyUrl(S.settings.proxy, url));
-  FALLBACK_PROXIES.forEach(p => { const u = proxyUrl(p, url); if (!tries.includes(u)) tries.push(u); });
-  let last;
-  for (let i = 0; i < tries.length; i++) {
-    onTry && onTry(i, tries.length);
-    try {
-      const ctl = new AbortController(); const tm = setTimeout(() => ctl.abort(), 15000);
-      const res = await fetch(tries[i], { signal: ctl.signal, credentials: 'omit' }); clearTimeout(tm);
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      const txt = await res.text();
-      if (txt.length > 300) return txt;
-      throw new Error('Empty page');
-    } catch (e) { last = e; }
-  }
-  throw last || new Error('Could not load page');
+function importRoutes(url) {
+  const t = [{ u: url, kind: 'html' }];
+  if (S.settings.proxy) t.push({ u: proxyUrl(S.settings.proxy, url), kind: 'html' });
+  FALLBACK_PROXIES.forEach(p => { const u = proxyUrl(p, url); if (!t.some(x => x.u === u)) t.push({ u, kind: 'html' }); });
+  t.push({ u: 'https://r.jina.ai/' + url, kind: 'md' }); // renders the page in a real browser, returns readable text
+  return t;
+}
+async function fetchText(u) {
+  const ctl = new AbortController(); const tm = setTimeout(() => ctl.abort(), 12000);
+  try {
+    const res = await fetch(u, { signal: ctl.signal, credentials: 'omit' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const txt = await res.text(); if (txt.length < 300) throw new Error('empty page'); return txt;
+  } finally { clearTimeout(tm); }
+}
+function parseMarkdown(md, url) {
+  const title = ((md.match(/^Title:\s*(.+)$/m) || [])[1] || '').trim().replace(/\s+[|–-]\s+[^|–-]*$/, '');
+  let body = md.split(/^Markdown Content:\s*$/m)[1] || md;
+  body = body.replace(/!\[[^\]]*\]\([^)]*\)/g, '').replace(/\[([^\]]*)\]\([^)]*\)/g, '$1').replace(/\*\*|__/g, '').replace(/^\s*[=-]{3,}\s*$/gm, '');
+  const r = parseText((title ? title + '\n' : '') + body);
+  let site = ''; try { site = new URL(url).hostname.replace(/^www\./, ''); } catch (e) {}
+  return fixRecipe(Object.assign(r, { sourceType: 'Website', source: site, sourceUrl: url }));
 }
 async function importUrl() {
   let url = $('#iu').value.trim(); const st = $('#istat');
   const m = url.match(/https?:\/\/\S+/); if (m) url = m[0];
   if (!/^https?:\/\//i.test(url)) { if (url && /\./.test(url)) url = 'https://' + url; else { st.textContent = 'Please enter a web address.'; return; } }
-  st.innerHTML = '<span class="spin"></span> Fetching page…';
-  try {
-    const html = await fetchPage(url, (i, n) => { st.innerHTML = `<span class="spin"></span> Fetching page… ${i ? `(route ${i + 1} of ${n})` : ''}`; });
-    const r = parseRecipeHtml(html, url);
-    if (!r.ingredients.length && !r.method.length) { st.innerHTML = '⚠️ Loaded the page but could not find a recipe on it. Try the <b>Paste text</b> tab instead.'; return; }
-    pendingImport = null; draft = r; go('edit/new'); toast('Recipe imported – check and save');
-  } catch (e) {
-    st.innerHTML = `⚠️ Could not load that page (${esc(e.message)}). The site may block importing. Try copying the recipe text and using <b>Paste text</b>.`;
+  const routes = importRoutes(url); let last = '';
+  for (let i = 0; i < routes.length; i++) {
+    st.innerHTML = `<span class="spin"></span> Fetching recipe… ${i ? `(trying route ${i + 1} of ${routes.length})` : ''}`;
+    try {
+      const txt = await fetchText(routes[i].u);
+      const r = routes[i].kind === 'md' ? parseMarkdown(txt, url) : parseRecipeHtml(txt, url);
+      if (r.ingredients.length || r.method.length) { pendingImport = null; draft = r; go('edit/new'); toast('Recipe imported – check and save'); return; }
+      last = 'page loaded but the site blocked the recipe';
+    } catch (e) { last = e.name === 'AbortError' ? 'timed out' : e.message; }
   }
+  st.innerHTML = `⚠️ Couldn't import that page (${esc(last)}). Big shops like Tesco and Waitrose block apps from reading their pages.<br>
+    <b>Fix:</b> use the <b>Save to Cooking</b> bookmark on the recipe page instead – it reads the recipe straight from your own browser.
+    <button class="btn primary block mt" onclick="bookmarkletHelp()">🔖 Set up Save to Cooking</button>`;
+}
+/* --- "Save to Cooking" bookmarklet: runs on the recipe page in the user's own browser, then opens this app with the recipe --- */
+function bookmarkletCode() {
+  const app = location.origin + location.pathname;
+  const src = `(function(){var A=${JSON.stringify(app)};
+function f(j){if(!j)return null;if(Array.isArray(j)){for(var i=0;i<j.length;i++){var r=f(j[i]);if(r)return r}return null}if(typeof j!='object')return null;var t=j['@type'];if(t=='Recipe'||(Array.isArray(t)&&t.indexOf('Recipe')>-1))return j;return f(j['@graph'])||f(j.mainEntity)||f(j.mainEntityOfPage)}
+var ld=null,s=document.querySelectorAll('script[type="application/ld+json"]');for(var i=0;i<s.length&&!ld;i++){try{ld=f(JSON.parse(s[i].textContent))}catch(e){}}
+function m(p){var e=document.querySelector('meta[property="'+p+'"]');return e?e.content:''}
+var d={v:1,url:location.href,title:m('og:title')||document.title,site:m('og:site_name'),image:m('og:image')};
+if(ld){delete ld.review;delete ld.comment;delete ld.video;d.ld=ld}
+if(!ld||!ld.recipeIngredient||!ld.recipeIngredient.length){var r=document.querySelector('article')||document.querySelector('main')||document.body;d.text=r.innerText.slice(0,40000)}
+location.href=A+String.fromCharCode(35)+'cookimport='+encodeURIComponent(JSON.stringify(d))})()`;
+  return 'javascript:' + src.replace(/\n/g, '');
+}
+function bookmarkletHelp() {
+  const ok = location.protocol === 'https:';
+  openModal(`<h3>🔖 Save to Cooking bookmark</h3>
+    <p class="muted">A one-off setup. After that, on any recipe page (Tesco, Waitrose or anywhere else) you tap the bookmark and the recipe opens here ready to save.</p>
+    ${ok ? '' : '<div class="banner">Open Cooking from its proper https:// web address first, then set this up, so the bookmark points to the right place.</div>'}
+    <ol style="padding-left:20px;margin:6px 0">
+      <li>Tap <b>Copy bookmark code</b> below.</li>
+      <li>In Chrome, open any page and tap <b>⋮ → ☆</b> to bookmark it, then tap <b>Edit</b>.</li>
+      <li>Change the name to <b>Save to Cooking</b>.</li>
+      <li>Delete the URL, paste the copied code in its place, and tap back to save.</li>
+    </ol>
+    <p class="muted"><b>To use it:</b> on a recipe page, tap the address bar, type <b>Save to Cooking</b> and tap the bookmark in the suggestions (the one with the ☆ star).</p>
+    <textarea id="bmCode" readonly style="min-height:90px;font-size:.72rem">${esc(bookmarkletCode())}</textarea>
+    <button class="btn primary block mt" onclick="copyBookmarklet()">📋 Copy bookmark code</button>`);
+}
+async function copyBookmarklet() {
+  const el = $('#bmCode');
+  try { await navigator.clipboard.writeText(el.value); toast('Copied – now paste it as the bookmark URL'); }
+  catch (e) { el.focus(); el.select(); document.execCommand('copy'); toast('Copied'); }
+}
+function handleCookImport(payload) {
+  try {
+    const d = JSON.parse(decodeURIComponent(payload));
+    let site = d.site || ''; if (!site) try { site = new URL(d.url).hostname.replace(/^www\./, ''); } catch (e) {}
+    let r = d.ld ? fromLd(d.ld, d.url) : null;
+    if (!r || (!r.ingredients.length && !r.method.length)) {
+      const t = parseText((d.title ? d.title.replace(/\s+[|–-]\s+[^|–-]*$/, '') + '\n' : '') + (d.text || ''));
+      r = r ? Object.assign(r, { ingredients: t.ingredients, method: t.method }) : t;
+    }
+    Object.assign(r, { sourceType: 'Website', source: site, sourceUrl: d.url || r.sourceUrl });
+    if (!r.image && d.image) r.image = d.image;
+    draft = r; location.replace('#edit/new');
+    toast(r.ingredients.length || r.method.length ? 'Recipe captured – check and save' : 'Could not find the recipe – please fill it in', 3000);
+  } catch (e) { toast('Could not read the recipe from that page'); location.replace('#recipes'); }
 }
 function importText() { const t = $('#it').value; if (!t.trim()) return; draft = parseText(t); pendingImport = null; go('edit/new'); toast('Check the details and save'); }
 function importHtml() {
@@ -725,12 +786,16 @@ function parseText(text) {
   const metH = /^(#+\s*)?(method|instructions?|directions|preparation|steps|how to make( it)?|to make)\s*:?$/i;
   const noteH = /^(#+\s*)?(notes?|tips?|cook'?s notes?|recipe notes?)\s*:?$/i;
   const metaRe = /^(serves|servings?|makes|yield|prep|preparation|cook(ing)? time|total time|ready in)\b/i;
-  const B = { pre: [], ing: [], met: [], note: [] }; let mode = 'pre';
+  const skipH = /^(#+\s*)?(you may also like|you might also like|related recipes|more recipes|see (more|all) .*recipes|reviews?|comments?|be the first to comment|nutrition(al)?( info(rmation)?)?|each serving contains|rate this recipe|share this recipe|rating details|freezing and defrosting.*|shop (the|ingredients).*|book a slot.*)\s*:?$/i;
+  const B = { pre: [], ing: [], met: [], note: [], skip: [] }; let mode = 'pre';
   for (const l of lines.slice(i + 1)) {
     if (!l) continue;
     if (ingH.test(l)) { mode = 'ing'; continue; }
     if (metH.test(l)) { mode = 'met'; continue; }
     if (noteH.test(l)) { mode = 'note'; continue; }
+    if (skipH.test(l)) { mode = 'skip'; continue; }
+    if (mode === 'ing' && /^(#+\s*)?for the .{2,35}$/i.test(l)) { B.ing.push('# ' + l.replace(/^#+\s*/, '').replace(/:$/, '')); continue; }
+    if (mode === 'ing' && /^#+\s*\S/.test(l)) { B.ing.push(l); continue; }
     B[mode].push(l);
   }
   const all = lines.join('\n');
